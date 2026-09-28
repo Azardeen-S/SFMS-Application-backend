@@ -2,6 +2,29 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { isMasterCompanyUser, isCrossCompanyRole, isCompanyScopedFullAdmin, getCompanyPlantCodes } = require('../utils/companyScope');
+
+// Shared plant-scoping decision for a GET list: only a true cross-company
+// role (Super Admin) sees everything - a company-scoped full admin (BU
+// Admin, even at the primary/master company) sees every plant in their own
+// company (not just their own single Plant_Code), everyone else is
+// restricted to their own plant via isPlantMatch (unchanged behavior).
+async function applyPlantScope(data, req, userPlantCode, userPlantName) {
+  if (!userPlantCode || userPlantCode === 'all' || userPlantCode === 'Global' || userPlantCode === '*' || userPlantCode === 'ADMIN') {
+    return data;
+  }
+  if (isCrossCompanyRole(req.user)) {
+    return data;
+  }
+  if (isCompanyScopedFullAdmin(req.user) && req.user?.companyCode) {
+    const allowedPlantCodes = await getCompanyPlantCodes(db, req.user.companyCode);
+    return data.filter((r) => {
+      const rowPlant = String(r.plant_code || r.Plant_Code || r.Plant_code || '').trim().toLowerCase();
+      return !rowPlant || allowedPlantCodes.has(rowPlant);
+    });
+  }
+  return data.filter((r) => isPlantMatch(r, userPlantCode, userPlantName));
+}
 
 function getExactTableName(tableParam) {
   if (!tableParam) return tableParam;
@@ -45,14 +68,19 @@ function getTableMeta(tableName) {
   if (name === 'mst_typereason_mapping' || name === 'mst_linestoppagereasonmapping' || name === 'mst_linestoppage_reasonmapping') return { pk: 'Id', delCol: 'Del_Status' };
   if (name === 'mst_functional_location') return { pk: 'Id', delCol: 'Del_Status' };
   if (name === 'mst_empl_automailsetting') return { pk: 'ID', delCol: 'Del_Status' };
-  if (name === 'mst_empl_smssetting') return { pk: 'sms_id', delCol: 'Del_Status' };
+  // "ID" (not "sms_id") is the reliable PK here: rows created via the
+  // SMS Settings Create form (routes/reports.js sms-settings/save) only
+  // populate "ID" - "sms_id" is left null on those rows - so using sms_id
+  // as the PK breaks update/delete/toggle-inactive with "Missing primary
+  // key (sms_id)" for any row created through that form.
+  if (name === 'mst_empl_smssetting') return { pk: 'ID', delCol: 'Del_Status' };
   if (name === 'doc_doclist' || name === 'mst_doclist') return { pk: 'DOCID', delCol: 'Del_Status' };
   if (name === 'vendor') return { pk: 'Vendor_Id', delCol: 'Is_Active' };
   return { pk: 'Id', delCol: 'Del_Status' };
 }
 
 function isPlantMatch(row, userPlantCode, userPlantName) {
-  if (!userPlantCode || userPlantCode === 'all' || userPlantCode === '*' || userPlantCode === 'ADMIN') {
+  if (!userPlantCode || userPlantCode === 'all' || userPlantCode === 'Global' || userPlantCode === '*' || userPlantCode === 'ADMIN') {
     return true;
   }
   const rowCode = String(row.plant_code || row.Plant_Code || row.Plant_code || '').trim();
@@ -77,7 +105,7 @@ router.get('/:table', authMiddleware, async (req, res) => {
     let rows;
     if (tableName.toLowerCase() === 'mst_typereason_mapping' || tableName.toLowerCase() === 'mst_linestoppagereasonmapping' || tableName.toLowerCase() === 'mst_linestoppage_reasonmapping') {
       try {
-        const queryPlant = req.query.plant_code || (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN' ? userPlantCode : null);
+        const queryPlant = req.query.plant_code || (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN' ? userPlantCode : null);
         let whereClause = '';
         const params = [];
 
@@ -125,7 +153,7 @@ router.get('/:table', authMiddleware, async (req, res) => {
           ORDER BY ph."Id" DESC
         `);
         let data = joinedRes.rows;
-        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
           data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
         }
         return res.status(200).json(data);
@@ -153,7 +181,7 @@ router.get('/:table', authMiddleware, async (req, res) => {
           ORDER BY c."Closure_ID" DESC
         `);
         let data = joinedRes.rows;
-        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
           data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
         }
         return res.status(200).json(data);
@@ -176,7 +204,7 @@ router.get('/:table', authMiddleware, async (req, res) => {
           LEFT JOIN "Mst_Shop" s ON CAST(m."Shop_code" AS VARCHAR) = CAST(s."Shop_code" AS VARCHAR) AND l."Plant_Code" = s."Plant_Code"
         `);
         let data = joinedRes.rows;
-        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
           data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
         }
         return res.status(200).json(data);
@@ -188,8 +216,9 @@ router.get('/:table', authMiddleware, async (req, res) => {
     if (tableName.toLowerCase() === 'mst_empl_smssetting') {
       try {
         const joinedRes = await db.query(`
-          SELECT 
-            DISTINCT ON (s."sms_id")
+          SELECT
+            DISTINCT ON (s."ID")
+            s."ID",
             s."sms_id",
             s."Sms_Type",
             s."Level_Name",
@@ -199,19 +228,18 @@ router.get('/:table', authMiddleware, async (req, res) => {
             COALESCE(p."plant_name"::varchar, s."Plant_Code"::varchar) AS "Plant_Name",
             COALESCE(sh."Shop_Name"::varchar, s."Shop_Code"::varchar) AS "Shop_Name",
             s."Mobile_No",
-            s."Plant_Code"
+            s."Plant_Code",
+            s."Emp_Id",
+            s."Dept",
+            s."Shop_Code"
           FROM "Mst_Empl_SMSSetting" s
-          LEFT JOIN "Mst_Employee" e ON (CAST(s."Emp_Id" AS VARCHAR) = CAST(e."Emp_No" AS VARCHAR) OR CAST(s."Emp_Id" AS VARCHAR) = CAST(e."Emp_Id" AS VARCHAR)) AND s."Plant_Code"::text = e."Plant_Code"::text
+          LEFT JOIN "Mst_Employee" e ON CAST(s."Emp_Id" AS VARCHAR) = CAST(e."Emp_No" AS VARCHAR) OR CAST(s."Emp_Id" AS VARCHAR) = CAST(e."Emp_Id" AS VARCHAR)
           LEFT JOIN "mst_dept" d ON CAST(s."Dept" AS VARCHAR) = CAST(d."dept_id" AS VARCHAR) AND s."Plant_Code"::text = d."Plant_Code"::text
           LEFT JOIN "plant" p ON CAST(s."Plant_Code" AS VARCHAR) = CAST(p."plant_code" AS VARCHAR)
           LEFT JOIN "Mst_Shop" sh ON CAST(s."Shop_Code" AS VARCHAR) = CAST(sh."Shop_code" AS VARCHAR) AND s."Plant_Code"::text = sh."Plant_Code"::text
-          WHERE (e."Del_Status" = 'N' OR e."Del_Status" IS NULL OR e."Emp_Id" IS NULL)
-          ORDER BY s."sms_id" DESC
+          ORDER BY s."ID" DESC
         `);
-        let data = joinedRes.rows;
-        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
-          data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
-        }
+        const data = await applyPlantScope(joinedRes.rows, req, userPlantCode, userPlantName);
         return res.status(200).json(data);
       } catch (jErr) {
         console.warn('Joined query failed for mst_empl_smssetting, falling back:', jErr.message);
@@ -242,7 +270,7 @@ router.get('/:table', authMiddleware, async (req, res) => {
           ORDER BY a."ID" DESC
         `);
         let data = joinedRes.rows;
-        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
           data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
         }
         return res.status(200).json(data);
@@ -261,7 +289,7 @@ router.get('/:table', authMiddleware, async (req, res) => {
           LEFT JOIN "plant" p ON CAST(v."Plant_Code" AS VARCHAR) = CAST(p."plant_code" AS VARCHAR)
         `);
         let data = joinedRes.rows;
-        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
           data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
         }
         return res.status(200).json(data);
@@ -282,12 +310,34 @@ router.get('/:table', authMiddleware, async (req, res) => {
           LEFT JOIN "plant" p ON CAST(s."Plant_Code" AS VARCHAR) = CAST(p."plant_code" AS VARCHAR)
         `);
         let data = joinedRes.rows;
-        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
           data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
         }
         return res.status(200).json(data);
       } catch (jErr) {
         console.warn('Joined query failed for Mst_Shift_Hours, falling back:', jErr.message);
+      }
+    }
+
+    if (tableName.toLowerCase() === 'mst_subgroup') {
+      try {
+        const joinedRes = await db.query(`
+          SELECT
+            sg.*,
+            g."Groupname" AS "Group_Name"
+          FROM "mst_SubGroup" sg
+          LEFT JOIN "mst_group" g ON CAST(sg."Group_Code" AS VARCHAR) = CAST(g."ID" AS VARCHAR)
+          ORDER BY sg."Id" DESC
+        `);
+        let data = joinedRes.rows;
+        if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+          data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
+        }
+        return res.status(200).json(data);
+      } catch (jErr) {
+        // Falls back to the raw select below until 01_migration.sql (adds
+        // mst_SubGroup."Group_Code") has been run in this environment.
+        console.warn('Joined query failed for mst_SubGroup, falling back:', jErr.message);
       }
     }
 
@@ -300,7 +350,7 @@ router.get('/:table', authMiddleware, async (req, res) => {
     }
     let data = rows.map(r => r.row_data);
 
-    if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN' && data.length > 0) {
+    if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN' && data.length > 0) {
       data = data.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
     }
 
@@ -337,11 +387,61 @@ router.post('/:table', authMiddleware, async (req, res) => {
     const columns = checkCols.rows.map(r => r.column_name);
     const lowerColumns = columns.map(c => c.toLowerCase());
 
-    // Inject plant code if needed
-    if (plantCode && lowerColumns.includes('plant_code')) {
+    const typeRes = await db.query(
+      'SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1',
+      [tableName]
+    );
+    const columnTypes = {};
+    typeRes.rows.forEach(r => { columnTypes[r.column_name] = r.data_type; });
+    const NUMERIC_TYPES = ['bigint', 'integer', 'smallint', 'numeric', 'double precision', 'real'];
+
+    // Same Problem Type label -> Type_Code resolution as the PUT handler below.
+    if (tableName.toLowerCase() === 'mst_typereason_mapping' && body.Problem_Type !== undefined && body.Type_Code === undefined) {
+      const problemTypeRes = await db.query(
+        'SELECT "Id" FROM "Mst_Type" WHERE "Type_Desc" = $1 AND "Plant_Code" = $2 LIMIT 1',
+        [body.Problem_Type, body.Plant_Code]
+      );
+      if (problemTypeRes.rows.length === 0) {
+        return res.status(400).json({ message: `No Problem Type "${body.Problem_Type}" found for Plant ${body.Plant_Code} in Mst_Type.` });
+      }
+      body.Type_Code = problemTypeRes.rows[0].Id;
+      delete body.Problem_Type;
+    }
+
+    // The Reason checkbox group submits a comma-joined list of Mst_Gap ids
+    // under "Reason", but the real column is "Reason_Code" and the schema
+    // stores one reason per row - a multi-select create must become one
+    // INSERT per selected reason, not a single row with a joined value.
+    let reasonCodesForInsert = null;
+    if (tableName.toLowerCase() === 'mst_typereason_mapping' && body.Reason !== undefined) {
+      reasonCodesForInsert = String(body.Reason).split(',').map(s => s.trim()).filter(Boolean);
+      delete body.Reason;
+      if (reasonCodesForInsert.length === 0) {
+        return res.status(400).json({ message: 'Select at least one Reason.' });
+      }
+      body.Reason_Code = reasonCodesForInsert[0];
+    }
+
+    // Inject plant code if needed - or, if the caller explicitly chose a
+    // different plant (e.g. a Super Admin creating a record under a plant
+    // other than their own), verify that plant actually belongs to their own
+    // company before allowing it. Master-company (RML-SLD) users are exempt,
+    // matching every other company-scoping check in this codebase.
+    if (lowerColumns.includes('plant_code')) {
       const plantColName = columns.find(c => c.toLowerCase() === 'plant_code');
       if (!body[plantColName]) {
-        body[plantColName] = plantCode;
+        if (plantCode) body[plantColName] = plantCode;
+      } else if (String(body[plantColName]) !== String(plantCode) && !isMasterCompanyUser(req.user)) {
+        // Always allow the user's own plant even if their company record is
+        // missing/orphaned; only fall back to the Company_Id lookup for a
+        // *different* plant than their own.
+        const ownPlantCheck = await db.query(
+          `SELECT 1 FROM "plant" WHERE plant_code = $1 AND "Company_Id" = (SELECT "Company_Id" FROM "Mst_Company" WHERE "Company_Code" = $2)`,
+          [body[plantColName], req.user.companyCode]
+        );
+        if (ownPlantCheck.rows.length === 0) {
+          return res.status(403).json({ message: 'You may only create records under a plant in your own company.' });
+        }
       }
     }
 
@@ -355,11 +455,26 @@ router.post('/:table', authMiddleware, async (req, res) => {
       if (!body[colName]) body[colName] = req.user?.empId || 'system';
     }
 
-    // Auto-generate PK if PK is not present in body
+    // Auto-generate the PK. For a numeric PK (the common case - Category_ID,
+    // Shop_code-style master IDs, etc.) always compute it server-side and
+    // ignore whatever the client sent, since a master-data form may still be
+    // sending a placeholder/free-text value (e.g. "CAT01") that can never be
+    // valid for a bigint/integer column anyway. Only a non-numeric PK column
+    // respects a client-supplied value.
     const { pk, delCol } = getTableMeta(tableName);
     const actualPk = columns.find(c => c.toLowerCase() === pk.toLowerCase()) || pk;
+    const pkIsNumeric = NUMERIC_TYPES.includes(columnTypes[actualPk]);
 
-    if (!body[actualPk] && !body[actualPk.toLowerCase()] && !body.id && !body.Id && !body.ID) {
+    const hasClientPk = !!(body[actualPk] || body[actualPk.toLowerCase()] || body.id || body.Id || body.ID);
+
+    if (pkIsNumeric || !hasClientPk) {
+      // Drop every case-variant of the PK key the client may have sent, so it
+      // can't later clobber the auto-generated value below via normalizedBody.
+      for (const key of Object.keys(body)) {
+        if (key.toLowerCase() === actualPk.toLowerCase() || key.toLowerCase() === 'id') {
+          delete body[key];
+        }
+      }
       try {
         const maxRes = await db.query(`SELECT COALESCE(MAX("${actualPk}"), 0) + 1 AS next_id FROM "${tableName}"`);
         if (maxRes.rows.length > 0 && maxRes.rows[0].next_id) {
@@ -399,10 +514,35 @@ router.post('/:table', authMiddleware, async (req, res) => {
     const insertVals = insertKeys.map(key => normalizedBody[key]);
 
     const sql = `INSERT INTO "${tableName}" (${colNames}) VALUES (${placeholders})`;
-    await db.query(sql, insertVals);
+
+    const reasonColIdx = insertKeys.findIndex(k => k.toLowerCase() === 'reason_code');
+    const pkColIdx = insertKeys.findIndex(k => k.toLowerCase() === actualPk.toLowerCase());
+
+    if (reasonCodesForInsert && reasonCodesForInsert.length > 1 && reasonColIdx !== -1) {
+      const startId = Number(insertVals[pkColIdx]);
+      for (let i = 0; i < reasonCodesForInsert.length; i++) {
+        const rowVals = [...insertVals];
+        rowVals[reasonColIdx] = reasonCodesForInsert[i];
+        if (pkColIdx !== -1 && pkIsNumeric && !isNaN(startId)) {
+          rowVals[pkColIdx] = startId + i;
+        }
+        await db.query(sql, rowVals);
+      }
+    } else {
+      await db.query(sql, insertVals);
+    }
     res.status(201).json({ message: 'Record created successfully.' });
   } catch (error) {
     console.error(`Error inserting into ${tableName}:`, error);
+    // Surface required-field / type-mismatch problems as a clear 400 instead of
+    // a raw 500 - these mean the form didn't send (or mis-typed) a required
+    // field, not a server fault.
+    if (error.code === '23502') {
+      return res.status(400).json({ message: `"${error.column}" is required.` });
+    }
+    if (error.code === '22P02') {
+      return res.status(400).json({ message: 'One of the values provided does not match the expected field type (e.g. a name was sent where a numeric code was expected).' });
+    }
     res.status(500).json({ message: error.message || 'Database error saving record details.' });
   }
 });
@@ -418,6 +558,33 @@ router.put('/:table/:id', authMiddleware, async (req, res) => {
     const checkCols = await db.query('SELECT column_name FROM sp_get_table_columns($1)', [tableName]);
     const columns = checkCols.rows.map(r => r.column_name);
     const lowerColumns = columns.map(c => c.toLowerCase());
+
+    // Mst_TypeReason_Mapping's Problem Type dropdown submits the fixed
+    // Man/Machine/Material/Method/Quality label (matched against Mst_Gap
+    // reasons by that same label), but the actual column is "Type_Code",
+    // which stores that plant's Mst_Type.Id - not the label text. Resolve
+    // the label to the right Mst_Type row for this plant before saving.
+    if (tableName.toLowerCase() === 'mst_typereason_mapping' && body.Problem_Type !== undefined && body.Type_Code === undefined) {
+      const plantForLookup = body.Plant_Code;
+      const ptRes = await db.query(
+        'SELECT "Id" FROM "Mst_Type" WHERE "Type_Desc" = $1 AND "Plant_Code" = $2 LIMIT 1',
+        [body.Problem_Type, plantForLookup]
+      );
+      if (ptRes.rows.length === 0) {
+        return res.status(400).json({ message: `No Problem Type "${body.Problem_Type}" found for Plant ${plantForLookup} in Mst_Type.` });
+      }
+      body.Type_Code = ptRes.rows[0].Id;
+      delete body.Problem_Type;
+    }
+
+    // An edit targets one existing row, so a Reason checkbox selection
+    // (even if multiple are checked) can only apply its first value to
+    // this row's single Reason_Code column - same name mismatch as above.
+    if (tableName.toLowerCase() === 'mst_typereason_mapping' && body.Reason !== undefined) {
+      const codes = String(body.Reason).split(',').map(s => s.trim()).filter(Boolean);
+      delete body.Reason;
+      if (codes.length > 0) body.Reason_Code = codes[0];
+    }
 
     // Inject ModifiedDt / ModifiedBy if they exist
     if (lowerColumns.includes('modifieddt')) {

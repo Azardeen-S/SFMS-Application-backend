@@ -13,13 +13,12 @@ async function uploadFileToFTP(localFilePath, remoteFileName) {
   client.ftp.verbose = false;
 
   try {
-    // const ftpHost = process.env.FTP_HOST || '10.102.2.10';
-    const ftpHost = process.env.FTP_HOST || '172.51.51.12';
+    const ftpHost = process.env.FTP_HOST || '192.168.31.92';
+    // const ftpHost = process.env.FTP_HOST || '10.51.12.45';
     const ftpPort = parseInt(process.env.FTP_PORT || '21', 10);
-    // const ftpUser = process.env.FTP_USER || 'rmlvlcyinhouse';
-    // const ftpPass = process.env.FTP_PASS || process.env.FTP_PWD || 'Password@123';
-    // const ftpPath = process.env.FTP_PATH || '/PM-SAP/IN/';
-    const ftpPath = process.env.FTP_PATH || 'D:\PM-SAP\IN';
+    const ftpUser = process.env.FTP_USER || 'Rane/16221';
+    const ftpPass = process.env.FTP_PASS || process.env.FTP_PWD || 'Ayaaz@001';
+    const ftpPath = process.env.FTP_PATH || '/PM-SAP/IN';
 
     await client.access({
       host: ftpHost,
@@ -29,7 +28,7 @@ async function uploadFileToFTP(localFilePath, remoteFileName) {
       secure: false
     });
 
-    const targetRemotePath = path.posix.join(ftpPath, remoteFileName);
+    const targetRemotePath = path.posix.join(ftpPath.replace(/\\/g, '/'), remoteFileName);
     await client.uploadFrom(localFilePath, targetRemotePath);
     console.log(`[FTP Success] File uploaded successfully: ${remoteFileName} -> ${targetRemotePath}`);
     return { success: true, remotePath: targetRemotePath };
@@ -65,7 +64,10 @@ function formatTimeHHMMSS(dateObj) {
 
 /**
  * Handle FTP file creation and upload when a Line Stoppage is logged (Create / Start Downtime)
- * Matches .NET WritedataCR & UploadFile logic in TrnLineStoppageController.cs
+ * Matches .NET WritedataCR & UploadFile logic in TrnLineStoppageController.cs EXACTLY:
+ *  - date part of the filename/content = DateTime.Now at the moment the CR is fired (.NET: slipdt = DateTime.Now.ToString("ddMMyyyy"))
+ *  - time part = the stoppage's stored Entry_Date time-of-day (.NET: CAST(Entry_Date As time))
+ *  - reason text = resolved Gap_Name (.NET: "select Gap_Name from Mst_Gap where id = " + cls.Reason)
  */
 async function handleLineStoppageCreateFTP(stoppageId, params = {}) {
   try {
@@ -133,7 +135,7 @@ async function handleLineStoppageCreateFTP(stoppageId, params = {}) {
       [sapMchnCode, startSlNo, stoppageId]
     );
 
-    // 5. Fetch Stoppage Reason Name (Gap_Name) from Mst_Gap
+    // 5. Fetch Stoppage Reason Name (Gap_Name) from Mst_Gap — matches .NET's resolved "reason" for the CR file
     let reasonName = '';
     if (lineReasonCode) {
       const gapRes = await db.query('SELECT "Gap_Name" FROM "Mst_Gap" WHERE "Id"::text = $1 LIMIT 1', [lineReasonCode]);
@@ -141,7 +143,9 @@ async function handleLineStoppageCreateFTP(stoppageId, params = {}) {
     }
 
     // 6. Format filename & content string
-    const slipdt = formatDateDDMMYYYY(entryDate);
+    // .NET: slipdt = DateTime.Now.ToString("ddMMyyyy") — the date is "now" (when the CR fires), NOT the stored Entry_Date.
+    // .NET: sliptime = CAST(Entry_Date As time) — the time-of-day IS the stoppage's stored entry time.
+    const slipdt = formatDateDDMMYYYY(new Date());
     const strtime = formatTimeHHMMSS(entryDate);
     const filename = `NOT_SFSM_CR_${sapMchnCode}_${slipdt}_${startSlNo}.txt`;
 
@@ -179,7 +183,11 @@ async function handleLineStoppageCreateFTP(stoppageId, params = {}) {
 
 /**
  * Handle FTP file creation and upload when a Line Stoppage is resolved/closed (Edit / Close Downtime)
- * Matches .NET WritedataCL & UploadFile logic in TrnLineStoppageController.cs
+ * Matches .NET WritedataCL & UploadFile logic in TrnLineStoppageController.cs EXACTLY:
+ *  - date part of the filename/content = DateTime.Now at the moment the CL is fired (.NET: slipdt = DateTime.Now.ToString("ddMMyyyy"))
+ *  - time part = the stoppage's stored Close_Date time-of-day (.NET: CAST(Close_Date As time))
+ *  - reason field = the RAW LineReason_Code (.NET passes cls.Reason, which is set equal to LineReason_Code at
+ *    creation time — the close file does NOT resolve it to Gap_Name, and does NOT use the closure remarks text)
  */
 async function handleLineStoppageCloseFTP(stoppageId, params = {}) {
   try {
@@ -193,7 +201,10 @@ async function handleLineStoppageCloseFTP(stoppageId, params = {}) {
     const machineCode = String(row.Machine_Code || params.machine_code || '');
     const closeDate = row.Close_Date || new Date();
     const notificationNo = row.Notification_No || params.notification_no || '';
-    const closureReason = row.Closure || params.closure || '';
+    // .NET's WritedataCL receives cls.Reason as its "reason" argument, and cls.Reason was set equal to
+    // LineReason_Code at creation time (cls.LineReason_Code = cls.Reason). So the CL file's reason field
+    // is the raw reason/gap CODE, not the resolved Gap_Name and not the closure remarks (Closure).
+    const reasonCode = String(row.LineReason_Code || params.linereason_code || '');
     const shortCloseStatus = row.ShortClose_Status || params.shortclose || false;
 
     // 2. Check problem type description
@@ -232,12 +243,14 @@ async function handleLineStoppageCloseFTP(stoppageId, params = {}) {
     const startSlNo = row.Start_slno || 1;
 
     // 5. Format filename & content string
-    const slipdt = formatDateDDMMYYYY(closeDate);
+    // .NET: slipdt = DateTime.Now.ToString("ddMMyyyy") — "now", not the stored Close_Date.
+    // .NET: sliptime = CAST(Close_Date As time) — the time-of-day IS the stoppage's stored close time.
+    const slipdt = formatDateDDMMYYYY(new Date());
     const strtime = formatTimeHHMMSS(closeDate);
     const filename = `NOT_SFSM_CL_${sapMchnCode}_${slipdt}_${startSlNo}.txt`;
 
-    const sc = (shortCloseStatus === true || shortCloseStatus === 'Y' || shortCloseStatus === 'true') ? 'Y' : 'N';
-    const fileContent = `${slipdt}|${strtime}|${closureReason}|${notificationNo}|${sc}`;
+    const sc = (shortCloseStatus === true || shortCloseStatus === 'Y' || shortCloseStatus === 'true' || shortCloseStatus === 1) ? 'Y' : 'N';
+    const fileContent = `${slipdt}|${strtime}|${reasonCode}|${notificationNo}|${sc}`;
 
     // 6. Ensure local directory exists & write file
     const localDirPath = path.join(__dirname, '..', 'Line_Start_Notepad');

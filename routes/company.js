@@ -2,11 +2,31 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { isMasterCompanyUser, isCrossCompanyRole } = require('../utils/companyScope');
 
-// GET all companies (active + inactive)
+// Company Master manages every tenant's company record, so only the primary
+// company's (RML-SLD) users may access it - other companies' admins must not
+// be able to see or edit it, even by calling the API directly.
+function requireMasterCompany(req, res, next) {
+  if (!isMasterCompanyUser(req.user)) {
+    return res.status(403).json({ message: 'Company Master is restricted to the primary company administrators.' });
+  }
+  next();
+}
+
+// GET all companies (active + inactive).
+// Only a true cross-company role (Super Admin) sees every tenant - everyone
+// else, including a BU Admin whose own employee record happens to belong to
+// the primary/master company, only ever sees their own company's row (not
+// blocked outright, so it stays safe for any screen that just needs "my
+// company" - e.g. a dropdown - without tripping a frontend auto-logout on a 403).
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { rows } = await db.query('SELECT * FROM "Mst_Company" ORDER BY "Company_Code" ASC');
+    if (isCrossCompanyRole(req.user)) {
+      const { rows } = await db.query('SELECT * FROM "Mst_Company" ORDER BY "Company_Code" ASC');
+      return res.status(200).json(rows);
+    }
+    const { rows } = await db.query('SELECT * FROM "Mst_Company" WHERE "Company_Code" = $1', [req.user.companyCode]);
     res.status(200).json(rows);
   } catch (error) {
     console.error('Error fetching companies:', error);
@@ -15,7 +35,7 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 // POST create new company
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, requireMasterCompany, async (req, res) => {
   const { Company_Code, Company_Name, Company_Short_Name } = req.body;
 
   if (!Company_Code || !Company_Name) {
@@ -47,8 +67,70 @@ router.post('/', authMiddleware, async (req, res) => {
     const maxRes = await db.query('SELECT COALESCE(MAX("Company_Id"), 0) + 1 AS next_id FROM "Mst_Company"');
     const nextId = maxRes.rows[0].next_id;
 
-    await db.query('INSERT INTO "Mst_Company" ("Company_Id", "Company_Code", "Company_Name", "Company_Short_Name", "Is_active") VALUES ($1, $2, $3, $4, true)', [nextId, Company_Code, Company_Name, shortName]);
-    res.status(201).json({ message: 'Company created successfully.' });
+    // plant.plant_code / Mst_Employee.Plant_Code are varchar(5), so the default HQ
+    // plant code must be derived, not just "<Company_Code>-HQ" (overflows for any
+    // Company_Code longer than ~2 chars and throws a DB error on save).
+    const codeBase = String(Company_Code).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 3) || 'PLT';
+    let defaultPlantCode = `${codeBase}HQ`.slice(0, 5);
+    for (let suffix = 1; suffix <= 9; suffix++) {
+      const existing = await db.query('SELECT 1 FROM plant WHERE plant_code = $1', [defaultPlantCode]);
+      if (existing.rows.length === 0) break;
+      defaultPlantCode = `${codeBase.slice(0, 4)}${suffix}`.slice(0, 5);
+    }
+
+    const defaultAdminEmpNo = `${Company_Code}ADMIN`;
+    const DEFAULT_ADMIN_PASSWORD = 'password@123';
+
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      await client.query(
+        'INSERT INTO "Mst_Company" ("Company_Id", "Company_Code", "Company_Name", "Company_Short_Name", "Is_active") VALUES ($1, $2, $3, $4, true)',
+        [nextId, Company_Code, Company_Name, shortName]
+      );
+
+      // Auto-create a default HQ plant so the new company's Super Admin has a Plant_Code to log in under
+      await client.query(
+        'INSERT INTO plant (plant_code, plant_name, del_status, "Company_Id", "CreatedDt") VALUES ($1, $2, \'N\', $3, NOW())',
+        [defaultPlantCode, `${shortName} HQ`, nextId]
+      );
+
+      // Auto-create a company-scoped admin login for this company with a
+      // default password that must be changed on first login. This role is
+      // company-scoped (not cross-company), which is the "BU Admin" label
+      // after the Super Admin / BU Admin name swap - see 01_migration.sql.
+      const empIdRes = await client.query('SELECT COALESCE(MAX("Emp_Id"), 0) + 1 AS next_id FROM "Mst_Employee"');
+      const nextEmpId = empIdRes.rows[0].next_id;
+
+      await client.query(`
+        INSERT INTO "Mst_Employee" (
+          "Emp_Id", "Emp_No", "Emp_Name", "Dept", "Designation", "Mail_Id", "Mobile_No",
+          "is_admin", "Password", "pwd", "Plant_Code", "Del_Status", "User_Name", "CreatedDt",
+          "emp_group", "company_code", "must_change_password"
+        ) VALUES (
+          $1, $2, $3, NULL, 'BU Admin', NULL, NULL,
+          1, $4, $4, $5, 'N', $3, NOW(),
+          'BU Admin', $6, true
+        )
+      `, [nextEmpId, defaultAdminEmpNo, 'BU Admin', DEFAULT_ADMIN_PASSWORD, defaultPlantCode, Company_Code]);
+
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+
+    res.status(201).json({
+      message: 'Company created successfully.',
+      defaultAdmin: {
+        username: defaultAdminEmpNo,
+        password: DEFAULT_ADMIN_PASSWORD,
+        plantCode: defaultPlantCode,
+      },
+    });
   } catch (error) {
     console.error('Error creating company:', error);
     res.status(500).json({ message: 'Database error saving company details.' });
@@ -56,7 +138,7 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // PUT update company details or status
-router.put('/:code', authMiddleware, async (req, res) => {
+router.put('/:code', authMiddleware, requireMasterCompany, async (req, res) => {
   const { code } = req.params;
   const { Company_Name, Company_Short_Name, Is_active } = req.body;
 
@@ -103,7 +185,7 @@ router.put('/:code', authMiddleware, async (req, res) => {
 });
 
 // DELETE toggle / soft delete company
-router.delete('/:code', authMiddleware, async (req, res) => {
+router.delete('/:code', authMiddleware, requireMasterCompany, async (req, res) => {
   const { code } = req.params;
 
   try {

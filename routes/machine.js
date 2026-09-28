@@ -37,7 +37,7 @@ router.get('/', authMiddleware, async (req, res) => {
     `);
     const userPlantCode = req.user?.plantCode || req.user?.plant_code;
     const userPlantName = req.user?.plantName || req.user?.plant_name;
-    if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+    if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
       rows = rows.filter(r => {
         const pCodeMatch = !r.plant_code || String(r.plant_code) === String(userPlantCode);
         const pNameMatch = !userPlantName || !r.plant_name || String(r.plant_name).toLowerCase() === String(userPlantName).toLowerCase();
@@ -53,8 +53,36 @@ router.get('/', authMiddleware, async (req, res) => {
 
 // POST create machine
 router.post('/', authMiddleware, async (req, res) => {
-  let { mchn_code, mchn_name, asset_no, sap_mchn_code, plant_code, shop_code, module_code, line_code } = req.body;
+  let { mchn_code, mchn_name, asset_no, sap_mchn_code, plant_code, shop_code, module_code, line_code,
+    group_id, subgroup_id, category_id, output_per_hr, is_rml_input, utility, critical_machine } = req.body;
   const sapCode = sap_mchn_code !== undefined ? sap_mchn_code : asset_no;
+
+  // sp_create_machine/sp_reactivate_machine only take the 7 identity/hierarchy
+  // params below - Group/Subgroup/Category/Output/the three flag checkboxes
+  // are never part of those procedures, so they must be written separately
+  // via a plain UPDATE right after, or they're silently never saved.
+  const extraColsUpdate = async (code) => {
+    const hasExtra = [group_id, subgroup_id, category_id, output_per_hr, is_rml_input, utility, critical_machine]
+      .some(v => v !== undefined);
+    if (!hasExtra) return;
+    await db.query(`
+      UPDATE "Mst_Machine" SET
+        "Group_code" = COALESCE($1, "Group_code"),
+        "SubGroup_Code" = COALESCE($2, "SubGroup_Code"),
+        "Cat_id" = COALESCE($3, "Cat_id"),
+        "outputperhr" = COALESCE($4, "outputperhr"),
+        "Is_RM_Input" = COALESCE($5, "Is_RM_Input"),
+        "Utility" = COALESCE($6, "Utility"),
+        "criticalmchn" = COALESCE($7, "criticalmchn")
+      WHERE TRIM("Mchn_code"::text) = TRIM($8::text)
+    `, [
+      group_id || null, subgroup_id || null, category_id || null, output_per_hr ?? null,
+      is_rml_input !== undefined ? (is_rml_input ? 1 : 0) : null,
+      utility !== undefined ? (utility ? 1 : 0) : null,
+      critical_machine !== undefined ? (critical_machine ? 1 : 0) : null,
+      code
+    ]);
+  };
   if (!mchn_name || !plant_code) {
     return res.status(400).json({ message: 'Machine name and plant code are required.' });
   }
@@ -74,6 +102,7 @@ router.post('/', authMiddleware, async (req, res) => {
         await db.query('SELECT sp_reactivate_machine($1, $2, $3, $4, $5, $6, $7)', [
           mchn_code, mchn_name, sapCode, plant_code, shop_code || null, module_code || null, line_code || null
         ]);
+        await extraColsUpdate(mchn_code);
         return res.status(200).json({ message: 'Machine reactivated successfully.' });
       }
       return res.status(400).json({ message: 'Machine code already exists.' });
@@ -82,6 +111,7 @@ router.post('/', authMiddleware, async (req, res) => {
     await db.query('SELECT sp_create_machine($1, $2, $3, $4, $5, $6, $7)', [
       mchn_code, mchn_name, sapCode, plant_code, shop_code || null, module_code || null, line_code || null
     ]);
+    await extraColsUpdate(mchn_code);
     res.status(201).json({ message: 'Machine asset created successfully.' });
   } catch (error) {
     console.error('Error creating machine:', error);
@@ -92,7 +122,8 @@ router.post('/', authMiddleware, async (req, res) => {
 // PUT update machine
 router.put('/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
-  const { mchn_name, asset_no, sap_mchn_code, plant_code, shop_code, module_code, line_code, del_status } = req.body;
+  const { mchn_name, asset_no, sap_mchn_code, plant_code, shop_code, module_code, line_code, del_status,
+    group_id, subgroup_id, category_id, output_per_hr, is_rml_input, utility, critical_machine } = req.body;
   try {
     if (del_status !== undefined) {
       await db.query('UPDATE "Mst_Machine" SET "Del_Status" = $1 WHERE TRIM("Mchn_code"::text) = TRIM($2::text)', [del_status, id]);
@@ -102,6 +133,31 @@ router.put('/:id', authMiddleware, async (req, res) => {
     await db.query('SELECT sp_update_machine($1, $2, $3, $4, $5, $6, $7)', [
       id, mchn_name, sapCode, plant_code, shop_code || null, module_code || null, line_code || null
     ]);
+
+    // sp_update_machine only covers the 7 identity/hierarchy params above -
+    // Group/Subgroup/Category/Output/the three flag checkboxes are not part
+    // of it, so write them separately or they're silently never saved.
+    const hasExtra = [group_id, subgroup_id, category_id, output_per_hr, is_rml_input, utility, critical_machine]
+      .some(v => v !== undefined);
+    if (hasExtra) {
+      await db.query(`
+        UPDATE "Mst_Machine" SET
+          "Group_code" = COALESCE($1, "Group_code"),
+          "SubGroup_Code" = COALESCE($2, "SubGroup_Code"),
+          "Cat_id" = COALESCE($3, "Cat_id"),
+          "outputperhr" = COALESCE($4, "outputperhr"),
+          "Is_RM_Input" = COALESCE($5, "Is_RM_Input"),
+          "Utility" = COALESCE($6, "Utility"),
+          "criticalmchn" = COALESCE($7, "criticalmchn")
+        WHERE TRIM("Mchn_code"::text) = TRIM($8::text)
+      `, [
+        group_id || null, subgroup_id || null, category_id || null, output_per_hr ?? null,
+        is_rml_input !== undefined ? (is_rml_input ? 1 : 0) : null,
+        utility !== undefined ? (utility ? 1 : 0) : null,
+        critical_machine !== undefined ? (critical_machine ? 1 : 0) : null,
+        id
+      ]);
+    }
     res.status(200).json({ message: 'Machine updated successfully.' });
   } catch (error) {
     console.error('Error updating machine:', error);
@@ -179,18 +235,26 @@ router.get('/categories', authMiddleware, async (req, res) => {
 
 // POST Batch update OEE Mapping
 router.post('/oee-mapping/save', authMiddleware, async (req, res) => {
-  const { listvals } = req.body;
+  const { listvals, masterdata } = req.body;
   try {
     if (Array.isArray(listvals)) {
       for (const item of listvals) {
         if (item.Id) {
           let catId = null;
+          // Category dropdown submits Category_Name (not the id), and
+          // category names are only unique per plant, not globally - e.g.
+          // plant 1150 and plant 3002 can each have their own "Quality
+          // Issues" category with different Category_IDs. Resolving by name
+          // alone silently picked whichever plant's row happened to match
+          // first, which then failed the plant-matched join in the GET
+          // query below and made the saved category disappear from the UI.
+          const plantForLookup = item.Plant_code || item.Plant_Code || masterdata?.plant_code || null;
           if (item.Cat_id) {
             catId = item.Cat_id;
           } else if (item.Category_Name) {
             const catRes = await db.query(
-              'SELECT "Category_ID" FROM "Mst_Category" WHERE "Category_Name" = $1 LIMIT 1',
-              [item.Category_Name]
+              'SELECT "Category_ID" FROM "Mst_Category" WHERE "Category_Name" = $1 AND ($2::text IS NULL OR CAST("Plant_Code" AS VARCHAR) = $2::text) LIMIT 1',
+              [item.Category_Name, plantForLookup]
             );
             if (catRes.rows.length > 0) catId = catRes.rows[0].Category_ID;
           }
@@ -203,7 +267,7 @@ router.post('/oee-mapping/save', authMiddleware, async (req, res) => {
               "criticalmchn" = COALESCE($3, "criticalmchn"),
               "ModifiedDt" = NOW()
             WHERE "Id" = $4
-          `, [catId, item.outputperhr || 0, item.criticalmchn ? true : false, item.Id]);
+          `, [catId, item.outputperhr || 0, item.criticalmchn ? 1 : 0, item.Id]);
         }
       }
     }

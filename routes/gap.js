@@ -4,7 +4,7 @@ const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
 
 function isPlantMatch(row, userPlantCode, userPlantName) {
-  if (!userPlantCode || userPlantCode === 'all' || userPlantCode === '*' || userPlantCode === 'ADMIN') {
+  if (!userPlantCode || userPlantCode === 'all' || userPlantCode === 'Global' || userPlantCode === '*' || userPlantCode === 'ADMIN') {
     return true;
   }
   const rowCode = String(row.plant_code || row.Plant_Code || '').trim();
@@ -41,7 +41,7 @@ router.get('/', authMiddleware, async (req, res) => {
 
     const userPlantCode = req.user?.plantCode || req.user?.plant_code;
     const userPlantName = req.user?.plantName || req.user?.plant_name;
-    if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
+    if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== 'Global' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
       rows = rows.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
     }
 
@@ -86,7 +86,7 @@ router.post('/', authMiddleware, async (req, res) => {
 // PUT update gap reason
 router.put('/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
-  const { gap_name, plant_code, del_status, Del_Status } = req.body;
+  const { gap_name, plant_code, del_status, Del_Status, problem_types } = req.body;
   const statusVal = del_status || Del_Status;
 
   try {
@@ -97,6 +97,28 @@ router.put('/:id', authMiddleware, async (req, res) => {
     if (gap_name && plant_code) {
       await db.query('UPDATE "Mst_Gap" SET "Gap_Name" = $1, "Plant_Code" = $2 WHERE CAST("Id" AS VARCHAR) = CAST($3 AS VARCHAR)', [gap_name, plant_code, id]);
     }
+
+    // Problem Types were only ever written on create (POST below) - editing
+    // an existing reason and checking/unchecking types silently did nothing,
+    // which is why older/edited rows show "-" for Problem Type. Rebuild the
+    // Mst_TypeReason_Mapping rows for this reason from whatever is checked
+    // now, same one-row-per-type approach the create path uses.
+    if (problem_types !== undefined && plant_code) {
+      await db.query(
+        'DELETE FROM "Mst_TypeReason_Mapping" WHERE CAST("Reason_Code" AS VARCHAR) = CAST($1 AS VARCHAR) AND CAST("Plant_Code" AS VARCHAR) = CAST($2 AS VARCHAR)',
+        [id, plant_code]
+      );
+      const typesArr = Array.isArray(problem_types) ? problem_types : String(problem_types).split(',').map(s => s.trim()).filter(Boolean);
+      for (const pType of typesArr) {
+        const typeRes = await db.query('SELECT "Id" FROM "Mst_Type" WHERE LOWER("Type_Desc") = LOWER($1) AND CAST("Plant_Code" AS VARCHAR) = $2 LIMIT 1', [pType, plant_code]);
+        if (typeRes.rows.length > 0) {
+          const typeId = typeRes.rows[0].Id;
+          const mapMax = await db.query('SELECT COALESCE(MAX("Id"), 0) + 1 AS next_id FROM "Mst_TypeReason_Mapping"');
+          await db.query(`INSERT INTO "Mst_TypeReason_Mapping" ("Id", "Type_Code", "Reason_Code", "Plant_Code") VALUES ($1, $2, $3, $4)`, [mapMax.rows[0].next_id, typeId, id, plant_code]);
+        }
+      }
+    }
+
     res.status(200).json({ message: 'Stoppage reason updated successfully.' });
   } catch (error) {
     console.error('Error updating gap reason:', error);

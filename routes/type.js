@@ -2,9 +2,10 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { isCrossCompanyRole, isCompanyScopedFullAdmin, getCompanyPlantCodes } = require('../utils/companyScope');
 
 function isPlantMatch(row, userPlantCode, userPlantName) {
-  if (!userPlantCode || userPlantCode === 'all' || userPlantCode === '*' || userPlantCode === 'ADMIN') {
+  if (!userPlantCode || userPlantCode === 'all' || userPlantCode === 'Global' || userPlantCode === '*' || userPlantCode === 'ADMIN') {
     return true;
   }
   const rowCode = String(row.plant_code || row.Plant_Code || '').trim();
@@ -22,14 +23,14 @@ function isPlantMatch(row, userPlantCode, userPlantName) {
 
 // GET all problem types
 router.get('/', authMiddleware, async (req, res) => {
-  const { activeOnly } = req.query;
+  const { activeOnly, plant_code: requestedPlantCode } = req.query;
   try {
     let whereClause = '';
     if (activeOnly === 'true' || activeOnly === '1') {
       whereClause = `WHERE t."Del_Status" = 'N'`;
     }
     let { rows } = await db.query(`
-      SELECT 
+      SELECT
         t."Id" AS id,
         t."Type_Desc" AS type_desc,
         t."Plant_Code" AS plant_code,
@@ -40,11 +41,35 @@ router.get('/', authMiddleware, async (req, res) => {
       ${whereClause}
       ORDER BY t."Id" DESC
     `);
-    const userPlantCode = req.user?.plantCode || req.user?.plant_code;
-    const userPlantName = req.user?.plantName || req.user?.plant_name;
 
-    if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
-      rows = rows.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
+    // Only a true cross-company role (Super Admin) can see/request any
+    // plant's Problem Types. Everyone else - including a BU Admin at the
+    // primary/master company - is bounded to their own company's plants,
+    // even if a specific ?plant_code= is requested. Without this, a caller
+    // could request another company's plant_code directly (e.g. a Line
+    // Stoppage Reason Mapping Plant dropdown scoped correctly, but this
+    // endpoint trusting the query param blindly) and see that other
+    // company's Problem Types.
+    if (!isCrossCompanyRole(req.user)) {
+      let allowedPlantCodes = null; // null = restricted to exactly their own plant
+      if (isCompanyScopedFullAdmin(req.user) && req.user?.companyCode) {
+        allowedPlantCodes = await getCompanyPlantCodes(db, req.user.companyCode);
+      }
+
+      if (requestedPlantCode) {
+        const requested = String(requestedPlantCode).trim().toLowerCase();
+        const ownPlant = String(req.user?.plantCode || req.user?.plant_code || '').trim().toLowerCase();
+        const isAllowed = allowedPlantCodes ? allowedPlantCodes.has(requested) : requested === ownPlant;
+        rows = isAllowed ? rows.filter(r => isPlantMatch(r, requestedPlantCode, '')) : [];
+      } else if (allowedPlantCodes) {
+        rows = rows.filter(r => allowedPlantCodes.has(String(r.plant_code || '').trim().toLowerCase()));
+      } else {
+        const userPlantCode = req.user?.plantCode || req.user?.plant_code;
+        const userPlantName = req.user?.plantName || req.user?.plant_name;
+        rows = rows.filter(r => isPlantMatch(r, userPlantCode, userPlantName));
+      }
+    } else if (requestedPlantCode) {
+      rows = rows.filter(r => isPlantMatch(r, requestedPlantCode, ''));
     }
     res.status(200).json(rows);
   } catch (error) {

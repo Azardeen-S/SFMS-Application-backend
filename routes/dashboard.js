@@ -2,18 +2,47 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { isCrossCompanyRole } = require('../utils/companyScope');
 
 // GET dashboard statistics
+// Scoped by who's asking:
+//   - Plant-level users (not admin) - only their own plant.
+//   - Every company admin, including a BU Admin at the primary/master
+//     company - only their own company's plants.
+//   - Only a true cross-company role (Super Admin) - everything, unscoped.
 router.get('/stats', authMiddleware, async (req, res) => {
   try {
-    const { rows } = await db.query('SELECT * FROM sp_get_dashboard_stats()');
-    const stats = rows[0];
+    const isAdmin = Number(req.user?.isAdmin) === 1
+      || req.user?.role === 'BU Admin'
+      || req.user?.empGroup === 'BU Admin'
+      || isCrossCompanyRole(req.user);
+
+    let allowedPlantCodes = null; // null = unrestricted (Super Admin only)
+    if (!isAdmin) {
+      allowedPlantCodes = req.user?.plantCode ? [req.user.plantCode] : [];
+    } else if (!isCrossCompanyRole(req.user)) {
+      const plantsRes = await db.query(
+        `SELECT plant_code FROM "plant" WHERE "Company_Id" = (SELECT "Company_Id" FROM "Mst_Company" WHERE "Company_Code" = $1)`,
+        [req.user.companyCode]
+      );
+      allowedPlantCodes = plantsRes.rows.map(r => r.plant_code);
+    }
+
+    const scoped = allowedPlantCodes !== null;
+    const params = scoped ? [allowedPlantCodes] : [];
+
+    const [plantsRow, empRow, stopRow, lineRow] = await Promise.all([
+      db.query(`SELECT COUNT(*) AS c FROM "plant" WHERE "del_status" = 'N' ${scoped ? 'AND plant_code = ANY($1::varchar[])' : ''}`, params),
+      db.query(`SELECT COUNT(*) AS c FROM "Mst_Employee" WHERE "Del_Status" = 'N' ${scoped ? 'AND "Plant_Code" = ANY($1::varchar[])' : ''}`, params),
+      db.query(`SELECT COUNT(*) AS c FROM "Trn_LineStoppage" WHERE "Status" = 'O' AND "Del_Status" = 'N' ${scoped ? 'AND "Plant_Code"::text = ANY($1::varchar[])' : ''}`, params),
+      db.query(`SELECT COUNT(*) AS c FROM "Mst_Line" WHERE "Del_Status" = 'N' ${scoped ? 'AND "Plant_code" = ANY($1::varchar[])' : ''}`, params),
+    ]);
 
     res.status(200).json({
-      plantsCount: parseInt(stats.plants_count),
-      employeesCount: parseInt(stats.employees_count),
-      activeStoppages: parseInt(stats.active_stoppages),
-      linesCount: parseInt(stats.lines_count)
+      plantsCount: parseInt(plantsRow.rows[0].c),
+      employeesCount: parseInt(empRow.rows[0].c),
+      activeStoppages: parseInt(stopRow.rows[0].c),
+      linesCount: parseInt(lineRow.rows[0].c)
     });
   } catch (error) {
     console.error('Error fetching dashboard stats:', error);
@@ -29,10 +58,23 @@ function buildWhereClause(reqUser, fdt, tdt, plant_code, p_status, dtype, bd) {
 
   const userPlantCode = reqUser?.plantCode || reqUser?.plant_code;
   const userPlantName = reqUser?.plantName || reqUser?.plant_name;
+  const isAdmin = Number(reqUser?.isAdmin) === 1
+    || reqUser?.role === 'BU Admin'
+    || reqUser?.empGroup === 'BU Admin'
+    || isCrossCompanyRole(reqUser);
 
-  let effectivePlant = plant_code;
-  if (userPlantCode && userPlantCode !== 'all' && userPlantCode !== '*' && userPlantCode !== 'ADMIN') {
-    effectivePlant = userPlantCode;
+  // Non-admin users are locked to their own plant; admins can use the
+  // plant filter (or see all plants in their own company when none is selected).
+  let effectivePlant = isAdmin ? plant_code : (userPlantCode || plant_code);
+
+  // Anyone other than a true cross-company role (Super Admin) is always
+  // bounded to their own company's plants, admin or not - otherwise a BU
+  // Admin at the primary company with no plant filter selected would see
+  // every company's data.
+  if (!isCrossCompanyRole(reqUser)) {
+    whereClause += ` AND p."Company_Id" = (SELECT "Company_Id" FROM "Mst_Company" WHERE "Company_Code" = $${paramIdx})`;
+    params.push(reqUser.companyCode);
+    paramIdx++;
   }
 
   if (fdt) {
@@ -156,10 +198,13 @@ router.get('/monthwise', authMiddleware, async (req, res) => {
 
     const result = await db.query(sql, params);
     
-    // If no records in filtered range, fetch top monthly summaries
+    // If no records in filtered range, fetch top monthly summaries - but still
+    // scoped to the same plant/company (dropping only the date range), never
+    // a global cross-company fallback.
     if (result.rows.length === 0) {
+      const { whereClause: fbWhereClause, params: fbParams } = buildWhereClause(req.user, null, null, plant_code, p_status, dtype, bd);
       const fallbackSql = `
-        SELECT 
+        SELECT
           TO_CHAR(tls."Entry_Date", 'Mon-YYYY') AS mnthyr,
           DATE_TRUNC('month', tls."Entry_Date") AS month_date,
           COUNT(tls."Id")::int AS total,
@@ -170,12 +215,13 @@ router.get('/monthwise', authMiddleware, async (req, res) => {
           COUNT(CASE WHEN p.plant_name ILIKE '%PONDICHERRY%' OR p.plant_name ILIKE '%PONDY%' THEN tls."Id" END)::int AS pondy
         FROM "Trn_LineStoppage" tls
         JOIN "plant" p ON tls."Plant_Code"::text = p.plant_code::text
-        WHERE tls."Del_Status" = 'N'
+        LEFT JOIN "Mst_Type" tp ON tls."Type_Code"::text = tp."Id"::text
+        ${fbWhereClause}
         GROUP BY TO_CHAR(tls."Entry_Date", 'Mon-YYYY'), DATE_TRUNC('month', tls."Entry_Date")
         ORDER BY month_date DESC
         LIMIT 6
       `;
-      const fallbackRes = await db.query(fallbackSql);
+      const fallbackRes = await db.query(fallbackSql, fbParams);
       return res.status(200).json(fallbackRes.rows.reverse());
     }
 

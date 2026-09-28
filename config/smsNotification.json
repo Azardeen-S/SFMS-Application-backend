@@ -1,0 +1,10 @@
+{
+  "enabled":true,
+  "intervalSeconds": 10,
+  "gatewayBaseUrl": "http://smartsms.net.in/sendsms",
+  "senderId": "RMLMSG",
+  "route": "T",
+  "peid": "1601507161907123194",
+  "tempIdStop": "1607100000000375135",
+  "tempIdStart": "1607100000000375136"
+}

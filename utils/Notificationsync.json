@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "intervalSeconds": 60,
+  "outPath": "/OUT",
+  "archiveSubfolder": "Processed",
+  "unmatchedSubfolder": "Unmatched",
+  "filePattern": "^NOT_SFSM_(CR|CL)_.+\\.txt$",
+  "deleteAfterProcessing": false
+}

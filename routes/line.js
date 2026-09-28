@@ -2,12 +2,35 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { isCrossCompanyRole } = require('../utils/companyScope');
 
 // GET all lines (including inactive for master table toggle)
+// Only a true cross-company role (Super Admin) sees every line across every
+// company - everyone else, including a BU Admin at the primary company,
+// is scoped to their own company's lines only.
+// Optional ?module_code=<code> (and/or ?shop_code=<code>) filters lines for
+// cascading Shop -> Module -> Line selects (e.g. on Functional Location creation).
 router.get('/', authMiddleware, async (req, res) => {
   try {
+    const { module_code, shop_code } = req.query;
+    const params = [];
+    const conditions = [];
+    if (!isCrossCompanyRole(req.user)) {
+      params.push(req.user.companyCode);
+      conditions.push(`p."Company_Id" = (SELECT "Company_Id" FROM "Mst_Company" WHERE "Company_Code" = $${params.length})`);
+    }
+    if (module_code) {
+      params.push(String(module_code));
+      conditions.push(`l."Module_code"::text = $${params.length}`);
+    }
+    if (shop_code) {
+      params.push(String(shop_code));
+      conditions.push(`l."Shop_code"::text = $${params.length}`);
+    }
+    const companyFilter = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
     const { rows } = await db.query(`
-      SELECT 
+      SELECT
         l."Line_code" AS line_code,
         l."Line_Name" AS line_name,
         l."Plant_code" AS plant_code,
@@ -21,8 +44,9 @@ router.get('/', authMiddleware, async (req, res) => {
       LEFT JOIN "plant" p ON l."Plant_code" = p.plant_code
       LEFT JOIN "Mst_Shop" s ON CAST(l."Shop_code" AS VARCHAR) = CAST(s."Shop_code" AS VARCHAR) AND l."Plant_code" = s."Plant_Code"
       LEFT JOIN "Mst_Module" m ON CAST(l."Module_code" AS VARCHAR) = CAST(m."Module_Code" AS VARCHAR) AND l."Plant_code" = m."Plant_code"
+      ${companyFilter}
       ORDER BY l."Line_Name" ASC
-    `);
+    `, params);
     res.status(200).json(rows);
   } catch (error) {
     console.error('Error fetching lines:', error);
@@ -38,7 +62,7 @@ router.post('/', authMiddleware, async (req, res) => {
   }
   try {
     if (!line_code) {
-      const maxRes = await db.query('SELECT COALESCE(MAX(CASE WHEN "Line_code" ~ \'^[0-9]+$\' THEN "Line_code"::bigint ELSE 0 END), 0) + 1 AS next_code FROM "Mst_Line"');
+      const maxRes = await db.query('SELECT COALESCE(MAX(CASE WHEN "Line_code"::text ~ \'^[0-9]+$\' THEN "Line_code" ELSE 0 END), 0) + 1 AS next_code FROM "Mst_Line"');
       line_code = String(maxRes.rows[0].next_code);
     }
 
@@ -68,7 +92,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
       await db.query('UPDATE "Mst_Line" SET "Del_Status" = $1 WHERE TRIM("Line_code"::text) = TRIM($2::text)', [del_status, id]);
       return res.status(200).json({ message: 'Line status updated successfully.' });
     }
-    await db.query('UPDATE "Mst_Line" SET "Line_Name" = $1, "Plant_code" = $2, "Shop_code" = $3, "Module_code" = $4, "ModifiedDt" = NOW() WHERE TRIM("Line_code"::text) = TRIM($5::text)', [line_name, plant_code, shop_code, module_code, id]);
+    await db.query('UPDATE "Mst_Line" SET "Line_Name" = $1, "Plant_code" = $2, "Shop_code" = $3, "Module_code" = $4, "modified_on" = NOW() WHERE TRIM("Line_code"::text) = TRIM($5::text)', [line_name, plant_code, shop_code, module_code, id]);
     res.status(200).json({ message: 'Production line updated successfully.' });
   } catch (error) {
     console.error('Error updating line:', error);

@@ -24,7 +24,19 @@ router.get('/', authMiddleware, async (req, res) => {
       const enrichedRows = rows.map(r => {
         const key = `${String(r.plant_code || '').trim()}_${String(r.line_code || '').trim()}`;
         const fl = r.functional_location || r.Functional_Location || flMap.get(key) || flMap.get(String(r.line_code || '').trim()) || '-';
-        return { ...r, functional_location: fl };
+
+        // SAP Remark: only meaningful for MACHINE-type, non-Service tickets — the same
+        // condition trnLineStoppage.jsx uses to gate the Close button on Notification_No.
+        // "Waiting SAP Notification" until SAP's OUT ack (via notificationSyncService.js)
+        // fills in Notification_No, then it flips to "Notification Recived" automatically.
+        const typeDesc = String(r.type_desc || r.Type_Desc || r.problem_type || '').trim().toLowerCase();
+        const isService = r.servicetype === 'Service';
+        const notificationNo = r.notification_no || r.Notification_No || '';
+        const sapRemark = (!isService && typeDesc === 'machine')
+          ? (notificationNo ? 'Notification Recived' : 'Waiting SAP Notification')
+          : '';
+
+        return { ...r, functional_location: fl, sap_remark: sapRemark };
       });
       return res.status(200).json(enrichedRows);
     } catch (enrichErr) {
@@ -66,8 +78,8 @@ router.post('/', authMiddleware, async (req, res) => {
     }
 
     // 3. Duplicate Stoppage Check (Machine already stopped check, matching .NET lines 85-98)
-    let checkQry = `SELECT COUNT("Id") AS count FROM "Trn_LineStoppage" 
-                    WHERE "Shop_Code"::text = $1 AND "Module_Code"::text = $2 AND "Line_Code"::text = $3 
+    let checkQry = `SELECT COUNT("Id") AS count FROM "Trn_LineStoppage"
+                    WHERE "Shop_Code"::text = $1 AND "Module_Code"::text = $2 AND "Line_Code"::text = $3
                       AND "Type_Code"::text = $4 AND "Machine_Code"::text = $5 AND "Close_Date" IS NULL AND "Del_Status" = 'N'`;
     const queryParams = [String(shop_code), String(module_code), String(line_code), String(type_code), String(machine_code)];
 
@@ -96,7 +108,7 @@ router.post('/', authMiddleware, async (req, res) => {
 
     // 5. Calculate Start Serial Number (Start_slno) for entry date (matching .NET line 125)
     const slRes = await db.query(
-      `SELECT COALESCE(MAX("Start_slno"), 0) + 1 AS next_slno FROM "Trn_LineStoppage" 
+      `SELECT COALESCE(MAX("Start_slno"), 0) + 1 AS next_slno FROM "Trn_LineStoppage"
        WHERE "Machine_Code" = $1 AND CAST("Entry_Date" AS DATE) = CAST($2 AS DATE)`,
       [String(machine_code), actualStartTime]
     );
@@ -112,7 +124,13 @@ router.post('/', authMiddleware, async (req, res) => {
       sapMchnCode = mchnRes.rows[0].SAPMchn_Code || '';
     }
 
-    // 7. Insert record into Trn_LineStoppage
+    // 7. Notification_No is intentionally left NULL at creation, matching .NET:
+    //    the .NET Create action never assigns Notification_No — it stays blank until SAP's
+    //    acknowledgement is written back to the record by a separate process. The Create grid
+    //    even disables the Close/STOP button for MACHINE-type tickets while this is blank
+    //    (see Create.cshtml). Do NOT generate a local number here.
+
+    // 8. Insert record into Trn_LineStoppage
     const insertRes = await db.query(
       `INSERT INTO "Trn_LineStoppage" (
         "Plant_Code", "Shop_Code", "Module_Code", "Line_Code", "Machine_Code",
@@ -132,10 +150,12 @@ router.post('/', authMiddleware, async (req, res) => {
 
     const createdId = insertRes.rows[0].Id;
 
-    // 8. Trigger FTP file creation & upload asynchronously (matching .NET lines 154-177)
-    handleLineStoppageCreateFTP(createdId, req.body).catch(err => {
-      console.error('Asynchronous FTP Create error:', err);
-    });
+    // 9. Trigger FTP file creation & upload — matching .NET's behavior exactly: the .NET action
+    //    calls WritedataCR + UploadFile synchronously with NO try/catch, so an FTP failure surfaces
+    //    as a failed request even though the DB row is already committed. We await it here (not
+    //    fire-and-forget) so the same thing happens: a real FTP/SAP error will produce an error
+    //    response, matching the .NET "same to same" behavior the record itself is still saved.
+    await handleLineStoppageCreateFTP(createdId, req.body);
 
     res.status(201).json({ message: 'Line stoppage transaction logged successfully.', id: createdId });
   } catch (error) {
@@ -148,11 +168,13 @@ router.post('/', authMiddleware, async (req, res) => {
 router.put('/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const {
-    status, close_date, endtime, closure, spares, user_id, breakdowntype,
+    status, closure, spares, user_id, breakdowntype,
     closed_by_emp_no, closed_by_emp_name, shortclose
   } = req.body;
 
-  const actualEndTime = close_date || endtime || new Date();
+  // .NET always stamps Close_Date = DateTime.Now on the server — it ignores any client-supplied
+  // close date/time entirely. Match that exactly: do not accept close_date/endtime from the request.
+  const actualEndTime = new Date();
 
   try {
     // 1. Fetch current stoppage record to get Machine_Code & Entry_Date
@@ -164,7 +186,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
 
     // 2. Calculate Stop Serial Number (Stop_SlNo) (matching .NET line 408)
     const stopRes = await db.query(
-      `SELECT COALESCE(MAX("Stop_SlNo"), 0) + 1 AS stopslno FROM "Trn_LineStoppage" 
+      `SELECT COALESCE(MAX("Stop_SlNo"), 0) + 1 AS stopslno FROM "Trn_LineStoppage"
        WHERE "Machine_Code" = $1 AND CAST("Entry_Date" AS DATE) = CAST($2 AS DATE)`,
       [row.Machine_Code, actualEndTime]
     );
@@ -192,10 +214,9 @@ router.put('/:id', authMiddleware, async (req, res) => {
       ]
     );
 
-    // 4. Trigger FTP file creation & upload for closure asynchronously (matching .NET lines 428-444)
-    handleLineStoppageCloseFTP(id, req.body).catch(err => {
-      console.error('Asynchronous FTP Close error:', err);
-    });
+    // 4. Trigger FTP file creation & upload for closure — same "same to same" note as Create:
+    //    .NET runs this synchronously with no try/catch, so we await it rather than fire-and-forget.
+    await handleLineStoppageCloseFTP(id, req.body);
 
     res.status(200).json({ message: 'Line stoppage closed successfully.' });
   } catch (error) {
@@ -203,8 +224,6 @@ router.put('/:id', authMiddleware, async (req, res) => {
     res.status(500).json({ message: 'Database error closing line stoppage.' });
   }
 });
-
-
 
 // DELETE soft delete transaction
 router.delete('/:id', authMiddleware, async (req, res) => {

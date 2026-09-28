@@ -2,12 +2,23 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { isCrossCompanyRole } = require('../utils/companyScope');
 
 // GET all departments (all records for status toggle view)
+// Only a true cross-company role (Super Admin) sees every department across
+// every company - everyone else, including a BU Admin at the primary
+// company, is scoped to their own company's departments only.
 router.get('/', authMiddleware, async (req, res) => {
   try {
+    const params = [];
+    let companyFilter = '';
+    if (!isCrossCompanyRole(req.user)) {
+      companyFilter = 'WHERE p."Company_Id" = (SELECT "Company_Id" FROM "Mst_Company" WHERE "Company_Code" = $1)';
+      params.push(req.user.companyCode);
+    }
+
     const { rows } = await db.query(`
-      SELECT 
+      SELECT
         d.dept_id,
         d.dept_name,
         d."Plant_Code" AS plant_code,
@@ -15,8 +26,9 @@ router.get('/', authMiddleware, async (req, res) => {
         COALESCE(p.plant_name, d."Plant_Code") AS plant_name
       FROM "mst_dept" d
       LEFT JOIN "plant" p ON CAST(d."Plant_Code" AS VARCHAR) = CAST(p.plant_code AS VARCHAR)
+      ${companyFilter}
       ORDER BY d.dept_name ASC
-    `);
+    `, params);
     res.status(200).json(rows);
   } catch (error) {
     console.error('Error fetching departments:', error);
@@ -77,6 +89,64 @@ router.put('/:id', authMiddleware, async (req, res) => {
     console.error('Error updating department:', error);
     res.status(500).json({ message: 'Database error updating department details.' });
   }
+});
+
+// POST bulk-create departments from a parsed spreadsheet - same pattern as
+// employee/bulk-upload: the frontend parses the .xlsx client-side and posts
+// plain JSON rows here. Restricted to BU Admin only, matching the same
+// restriction on employee bulk upload.
+router.post('/bulk-upload', authMiddleware, async (req, res) => {
+  const role = String(req.user?.role || req.user?.empGroup || '').trim().toLowerCase();
+  if (role !== 'bu admin') {
+    return res.status(403).json({ message: 'Bulk department upload is restricted to BU Admin.' });
+  }
+
+  const { departments } = req.body;
+  if (!Array.isArray(departments) || departments.length === 0) {
+    return res.status(400).json({ message: 'No department rows provided.' });
+  }
+
+  const results = [];
+  for (const [index, row] of departments.entries()) {
+    const rowNum = index + 2;
+    const deptName = String(row.deptName || row.Dept_Name || '').trim();
+    const plantCode = String(row.plantCode || row.Plant_Code || '').trim();
+
+    if (!deptName || !plantCode) {
+      results.push({ row: rowNum, deptName, success: false, message: 'Dept_Name and Plant_Code are required.' });
+      continue;
+    }
+
+    try {
+      const check = await db.query(
+        'SELECT 1 FROM "mst_dept" WHERE LOWER(TRIM(dept_name)) = LOWER(TRIM($1)) AND "Plant_Code" = $2',
+        [deptName, plantCode]
+      );
+      if (check.rows.length > 0) {
+        results.push({ row: rowNum, deptName, success: false, message: 'Department already exists for this plant.' });
+        continue;
+      }
+
+      const maxRes = await db.query('SELECT COALESCE(MAX(dept_id), 0) + 1 AS next_id FROM "mst_dept"');
+      const nextId = maxRes.rows[0].next_id;
+
+      await db.query(
+        'INSERT INTO "mst_dept" (dept_id, dept_code, dept_name, "Plant_Code", del_status, "CreatedDt") VALUES ($1, $2, $3, $4, \'N\', NOW())',
+        [nextId, String(nextId), deptName, plantCode]
+      );
+
+      results.push({ row: rowNum, deptName, success: true, message: 'Created' });
+    } catch (error) {
+      console.error(`Bulk upload row ${rowNum} (${deptName}) failed:`, error.message);
+      results.push({ row: rowNum, deptName, success: false, message: error.message || 'Database error.' });
+    }
+  }
+
+  const successCount = results.filter((r) => r.success).length;
+  res.status(200).json({
+    message: `${successCount} of ${departments.length} department(s) created successfully.`,
+    results,
+  });
 });
 
 // DELETE soft delete department

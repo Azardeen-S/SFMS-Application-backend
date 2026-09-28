@@ -175,10 +175,10 @@ router.post('/sms-time-mapping/save', authMiddleware, async (req, res) => {
           }
 
           await db.query(`
-            INSERT INTO "Mst_Employee_SMS" 
-              ("Plant_Code", "Type_Code", "Level1", "Level2", "Level3", "Level4", "CreatedDt", "Created_By")
-            VALUES 
-              ($1, $2, $3, $4, $5, $6, NOW(), '0')
+            INSERT INTO "Mst_Employee_SMS"
+              ("Id", "Plant_Code", "Type_Code", "Level1", "Level2", "Level3", "Level4", "CreatedDt", "Created_By")
+            VALUES
+              ((SELECT COALESCE(MAX("Id"), 0) + 1 FROM "Mst_Employee_SMS"), $1, $2, $3, $4, $5, $6, NOW(), '0')
           `, [
             plantCode || item.Plant_Code,
             typeCode || '0',
@@ -200,29 +200,139 @@ router.post('/sms-time-mapping/save', authMiddleware, async (req, res) => {
 // POST Save SMS Settings Create form
 router.post('/sms-settings/save', authMiddleware, async (req, res) => {
   const { plantCode, smsType, levelName, dept, empId, mobileNo, shopCode, types, modules } = req.body;
+  // Edit mode identifies the group being replaced by its ORIGINAL Plant/Emp/
+  // Level/Shop (the values the form was loaded with), which is not
+  // necessarily the same as the current form fields if the user changed any
+  // of them before saving. Without this, changing e.g. the Shop while
+  // editing meant the delete-then-recreate below searched for the NEW shop
+  // code, never found the original row (still sitting under the OLD shop
+  // code), left it orphaned, and inserted a second/duplicate row instead of
+  // replacing it. Falls back to the current values for a genuine create
+  // (nothing to delete there anyway).
+  const {
+    originalPlantCode = plantCode,
+    originalEmpId = empId,
+    originalLevelName = levelName,
+    originalShopCode = shopCode,
+  } = req.body;
 
   try {
     const selectedTypes = Array.isArray(types) ? types : [];
     const selectedModules = Array.isArray(modules) ? modules : [];
 
+    // One Mst_Empl_SMSSetting row is written per selected Module below - with
+    // none selected that loop is a no-op, so this used to return 200 "Data
+    // Saved Successfully" having written nothing at all, and the setting
+    // would just never appear in the SMS Settings list with no indication
+    // why. Fail loudly instead of succeeding silently.
+    if (selectedModules.length === 0) {
+      return res.status(400).json({ message: 'Select at least one Target Module.' });
+    }
+
+    // Clean up the Dtls rows for whatever settings we're about to replace -
+    // Mst_Empl_SMSSettingDtls has no ON DELETE CASCADE, so skipping this leaves
+    // orphaned rows behind every time this employee's settings are re-saved.
+    const oldRows = await db.query(
+      `SELECT "sms_id" FROM "Mst_Empl_SMSSetting"
+       WHERE "Plant_Code" = $1 AND "Emp_Id" = $2 AND "Level_Name" = $3 AND "Shop_Code" = $4
+         AND "sms_id" IS NOT NULL`,
+      [originalPlantCode, originalEmpId, originalLevelName, originalShopCode]
+    );
+    const oldSmsIds = oldRows.rows.map((r) => r.sms_id);
+    if (oldSmsIds.length > 0) {
+      await db.query('DELETE FROM "Mst_Empl_SMSSettingDtls" WHERE "Empl_SmsID" = ANY($1::bigint[])', [oldSmsIds]);
+    }
+
     await db.query(`
       DELETE FROM "Mst_Empl_SMSSetting"
       WHERE "Plant_Code" = $1 AND "Emp_Id" = $2 AND "Level_Name" = $3 AND "Shop_Code" = $4
-    `, [plantCode, empId, levelName, shopCode]);
+    `, [originalPlantCode, originalEmpId, originalLevelName, originalShopCode]);
 
     for (const modCode of selectedModules) {
-      await db.query(`
+      // "ID" has no DB-side default (not serial/identity), so it must be supplied
+      // explicitly - compute it in the same statement to avoid a race between a
+      // separate SELECT and this INSERT. "sms_id" is set to the same generated
+      // value so the Mst_Empl_SMSSettingDtls rows inserted below (one per
+      // selected problem type) can find this row back via Empl_SmsID - without
+      // this, sms_id stayed NULL and smsNotificationService.js's Dtls join
+      // (which is how it resolves Type_Code for a recipient) never matched,
+      // so nobody created through this form ever actually received an SMS.
+      const insertRes = await db.query(`
         INSERT INTO "Mst_Empl_SMSSetting"
-          ("Sms_Type", "Level_Name", "Emp_Id", "Mobile_No", "Dept", "Shop_Code", "Module_Code", "Plant_Code", "CreatedDt")
+          ("ID", "sms_id", "Sms_Type", "Level_Name", "Emp_Id", "Mobile_No", "Dept", "Shop_Code", "Module_Code", "Plant_Code", "CreatedDt")
         VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+          ((SELECT COALESCE(MAX("ID"), 0) + 1 FROM "Mst_Empl_SMSSetting"),
+           (SELECT COALESCE(MAX("ID"), 0) + 1 FROM "Mst_Empl_SMSSetting"),
+           $1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        RETURNING "ID" AS id
       `, [smsType, levelName, empId, mobileNo, dept, shopCode, modCode, plantCode]);
+
+      const newSmsId = insertRes.rows[0].id;
+
+      for (const typeCode of selectedTypes) {
+        await db.query(`
+          INSERT INTO "Mst_Empl_SMSSettingDtls"
+            ("ID", "Empl_SmsID", "Type_Code", "Plant_Code", "CreatedDt")
+          VALUES
+            ((SELECT COALESCE(MAX("ID"), 0) + 1 FROM "Mst_Empl_SMSSettingDtls"), $1, $2, $3, NOW())
+        `, [newSmsId, typeCode, plantCode]);
+      }
     }
 
     res.status(200).json({ message: 'Data Saved Successfully' });
   } catch (error) {
     console.error('Error saving SMS settings:', error);
     res.status(500).json({ message: 'Error saving SMS settings.' });
+  }
+});
+
+// GET existing SMS Settings for one employee/level/shop group, for the Edit
+// screen - aggregates every Module_Code row saved for this group plus the
+// union of problem-Type_Codes assigned across their Mst_Empl_SMSSettingDtls
+// rows, so the Create/Edit form (which is one row per module, but a single
+// shared Types selection in the .NET original) can pre-check both panels.
+router.get('/sms-settings/detail', authMiddleware, async (req, res) => {
+  const { plantCode, empId, levelName, shopCode } = req.query;
+  if (!plantCode || !empId || !levelName || !shopCode) {
+    return res.status(400).json({ message: 'plantCode, empId, levelName and shopCode are required.' });
+  }
+
+  try {
+    const rowsRes = await db.query(
+      `SELECT "sms_id", "Sms_Type", "Mobile_No", "Dept", "Module_Code"
+       FROM "Mst_Empl_SMSSetting"
+       WHERE "Plant_Code" = $1 AND "Emp_Id" = $2 AND "Level_Name" = $3 AND "Shop_Code" = $4`,
+      [plantCode, empId, levelName, shopCode]
+    );
+
+    if (rowsRes.rows.length === 0) {
+      return res.status(404).json({ message: 'No SMS setting found for this employee/level/shop.' });
+    }
+
+    const smsIds = rowsRes.rows.map((r) => r.sms_id).filter((v) => v !== null && v !== undefined);
+    let types = [];
+    if (smsIds.length > 0) {
+      const typesRes = await db.query(
+        'SELECT DISTINCT "Type_Code" FROM "Mst_Empl_SMSSettingDtls" WHERE "Empl_SmsID" = ANY($1::bigint[])',
+        [smsIds]
+      );
+      types = typesRes.rows.map((r) => r.Type_Code);
+    }
+
+    res.status(200).json({
+      plantCode,
+      smsType: rowsRes.rows[0].Sms_Type,
+      levelName,
+      dept: rowsRes.rows[0].Dept,
+      empId,
+      mobileNo: rowsRes.rows[0].Mobile_No,
+      shopCode,
+      modules: rowsRes.rows.map((r) => r.Module_Code),
+      types
+    });
+  } catch (error) {
+    console.error('Error fetching SMS setting detail:', error);
+    res.status(500).json({ message: 'Error retrieving SMS setting detail.' });
   }
 });
 
