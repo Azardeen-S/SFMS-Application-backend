@@ -58,6 +58,10 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
+// Only company mail IDs are allowed (manual create/edit and bulk upload).
+const MAIL_DOMAIN = '@ranegroup.com';
+const isCompanyMail = (m) => typeof m === 'string' && /^[A-Za-z0-9._-]+@ranegroup\.com$/i.test(m.trim());
+
 // POST create new employee
 router.post('/', authMiddleware, async (req, res) => {
   const { 
@@ -67,6 +71,9 @@ router.post('/', authMiddleware, async (req, res) => {
 
   if (!empNo || !empName || !plantCode) {
     return res.status(400).json({ message: 'Employee number, name, and plant code are required.' });
+  }
+  if (mailId && !isCompanyMail(mailId)) {
+    return res.status(400).json({ message: `Mail Id must be a ${MAIL_DOMAIN} address.` });
   }
 
   try {
@@ -125,6 +132,10 @@ router.put('/:id', authMiddleware, async (req, res) => {
         );
       }
       return res.status(200).json({ message: 'Employee status updated.' });
+    }
+
+    if (mailId && !isCompanyMail(mailId)) {
+      return res.status(400).json({ message: `Mail Id must be a ${MAIL_DOMAIN} address.` });
     }
 
     const updateRes = await db.query('SELECT sp_update_employee($1, $2, $3, $4, $5, $6, $7, $8, $9)', [
@@ -210,7 +221,11 @@ router.post('/bulk-upload', authMiddleware, async (req, res) => {
       }
 
       const designation = row.designation || row.Designation || null;
-      const mailId = row.mailId || row.Mail_Id || null;
+      const mailId = String(row.mailId || row.Mail_Id || '').trim();
+      if (!isCompanyMail(mailId)) {
+        results.push({ row: rowNum, empNo, success: false, message: `Mail_Id "${mailId}" is not allowed. Only ${MAIL_DOMAIN} mail IDs are accepted.` });
+        continue;
+      }
       const mobileNo = row.mobileNo || row.Mobile_No ? String(row.mobileNo || row.Mobile_No) : null;
       const password = row.password || row.Password || 'Welcome@123';
       const companyCode = row.companyCode || row.Company_Code || null;
