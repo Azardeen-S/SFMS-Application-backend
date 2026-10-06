@@ -68,7 +68,7 @@ async function getRecipients(plantCode, level) {
   const res = await db.query(
     `SELECT DISTINCT a."ID", a."EmailID"
      FROM "Mst_Empl_AutoMailSetting" a
-     WHERE a."Plant_Code" = $1 AND a."Level_Name" = $2 AND a."Del_Status" = 'N'`,
+     WHERE a."Plant_Code" = $1 AND REPLACE(a."Level_Name", ' ', '') = $2 AND a."Del_Status" = 'N'`,
     [plantCode, level]
   );
   return res.rows;
@@ -90,13 +90,17 @@ async function getPendingRows(plantCode, typeCode, minHours) {
   const res = await db.query(
     `SELECT t."Id", t.servicetype, s."Shop_Name", m."Module_Name", l."Line_Name",
             (SELECT mc."Mchn_Name" FROM "Mst_Machine" mc WHERE TRIM(mc."Mchn_code"::text) = TRIM(t."Machine_Code"::text) LIMIT 1) AS mchn_name,
-            t."Entry_Date", t."Reason",
+            t."Entry_Date",
+            -- "Reason" now holds the reason CODE (as in the .NET database), so show its name
+            COALESCE((SELECT g."Gap_Name" FROM "Mst_Gap" g
+                      WHERE g."Id"::text = t."LineReason_Code"::text AND g."Plant_Code"::text = t."Plant_Code"::text LIMIT 1),
+                     t."Reason") AS "Reason",
             EXTRACT(EPOCH FROM (now() - t."Entry_Date")) / 3600.0 AS hrs
      FROM "Trn_LineStoppage" t
      LEFT JOIN "Mst_Shop" s ON t."Shop_Code" = s."Shop_code"
      LEFT JOIN "Mst_Module" m ON t."Module_Code" = m."Module_Code"
      LEFT JOIN "Mst_Line" l ON t."Line_Code" = l."Line_code"
-     WHERE t."Del_Status" = 'N' AND t."Plant_Code" = $1 AND t."Type_Code"::text = $2::text
+     WHERE COALESCE(t."Del_Status", 'N') = 'N' AND t."Plant_Code" = $1 AND t."Type_Code"::text = $2::text
        AND t."Close_Date" IS NULL
        AND EXTRACT(EPOCH FROM (now() - t."Entry_Date")) / 3600.0 > $3
      ORDER BY t."Entry_Date"`,
@@ -121,9 +125,9 @@ function buildTableHtml(rows, typeDesc, level) {
       `<td align="center">${row.Module_Name || ''}</td>` +
       `<td align="center">${row.Line_Name || ''}</td>` +
       `<td align="center">${row.mchn_name || ''}</td>` +
-      `<td align="center">${row.Entry_Date || ''}</td>` +
+      `<td align="center">${row.Entry_Date ? new Date(row.Entry_Date).toLocaleString('en-GB') : ''}</td>` +
       `<td align="center">${row.Reason || ''}</td>` +
-      `<td align="center">${(row.hrs || 0).toFixed(1)}</td>` +
+      `<td align="center">${(Number(row.hrs) || 0).toFixed(1)}</td>` +
       `</tr>`;
   });
   html += `<tr><th colspan="8" align="right">Total Hours</th><td align="center">${totalHrs.toFixed(1)}</td></tr></table></center>`;

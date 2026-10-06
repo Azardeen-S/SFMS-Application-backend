@@ -61,7 +61,9 @@ router.get('/datewise', authMiddleware, async (req, res) => {
       mchn_name: r.mchn_name || '-',
       type_desc: r.type_desc || '-',
       gap_name: r.gap_name || '-',
-      status: r.Status || r.status || 'O',
+      // "Status" holds the SMS escalation level (Level1..4) as in the .NET app, not open/closed -
+      // a ticket is open until it has a Close_Date.
+      status: (r.End_Time || r.close_date) ? 'C' : 'O',
       entry_date: r.Start_Time || r.entry_date || null,
       close_date: r.End_Time || r.close_date || null,
       closure: r.Closure || r.closure || '-',

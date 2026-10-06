@@ -215,3 +215,133 @@ WHERE NOT EXISTS (
   WHERE a."Role_ID" = r."Role_ID"
     AND a."Screen_ID" = (SELECT "Screen_ID" FROM "Mst_Screen" WHERE "Screen_Code" = 'sms_log')
 );
+
+-- Machine OEE Mapping menu/screen removed from the app (route, sidebar entry,
+-- and page deleted). Deactivate rather than delete, so Access_ID history and
+-- any FK references stay intact - Mst_Access/Mst_Screen are both read with
+-- "Active_Status = 1" filters, so this fully hides it everywhere (Sidebar,
+-- Role Master) without touching other screens' rows.
+UPDATE "Mst_Access" SET "Active_Status" = 0
+WHERE "Screen_ID" = (SELECT "Screen_ID" FROM "Mst_Screen" WHERE "Screen_Code" = 'machine_oee');
+
+UPDATE "Mst_Screen" SET "Active_Status" = 0
+WHERE "Screen_Code" = 'machine_oee';
+
+-- ----------------------------------------------------------------------------
+-- Production is missing three audit columns on "Mst_Line" that exist in quality
+-- (found by transfer_quality_to_prod.ps1's schema check). Without them the
+-- data-only load from quality fails on Mst_Line ("column does not exist").
+-- Additive and idempotent - safe to run once on production before the transfer.
+-- ----------------------------------------------------------------------------
+ALTER TABLE "Mst_Line" ADD COLUMN IF NOT EXISTS "CreatedDt"  timestamp without time zone;
+ALTER TABLE "Mst_Line" ADD COLUMN IF NOT EXISTS "ModifiedBy" bigint;
+ALTER TABLE "Mst_Line" ADD COLUMN IF NOT EXISTS "ModifiedDt" timestamp without time zone;
+
+-- ----------------------------------------------------------------------------
+-- LINE STOPPAGE - store and read tickets exactly like the .NET application.
+-- Run ONLY this block (not the whole file) on production, after deploying the backend change that
+-- matches it (routes/trnLineStoppage.js, utils/smsNotificationService.js).
+--
+-- What the .NET database actually does (read from the legacy database script):
+--   * "Status" is the SMS escalation level (NULL -> Level1 -> Level2 -> Level3 -> Level4), never an
+--     open/closed flag. A ticket is open while "Close_Date" IS NULL.
+--   * A new ticket stores the reason CODE in "Reason" and the typed remarks in "Details"; closing
+--     overwrites "Reason" with the typed resolution remarks.
+--   * "Closure", "Phenomena", "Breakdowntype", "Vendor" hold lookup CODES (Mst_Closure.Closure_ID,
+--     Phenomena.Id, Mst_BreakDown.BD_ID, VENDOR.Vendor); the screens show their names.
+--
+-- sp_get_line_stoppages (the ticket list) is redefined for that: same columns as before, but
+--   reason  = the creation remarks ("Details", falling back to a non-numeric "Reason"),
+--   closure = the resolution remarks when closed, else the Closure name,
+--   breakdowntype = the Breakdown name, and a NULL "Del_Status" counts as active.
+-- Which tickets are returned (the Open / Closed ticket tabs):
+--   * no date range given (default): EVERY open ticket however old, so unresolved work never drops off
+--     the Open tab, plus the tickets CLOSED today or yesterday (T and T-1).
+--   * a date range given (from / to, both inclusive): open tickets STARTED in the range and tickets
+--     CLOSED in the range (at most the newest 5000 closed ones).
+-- ----------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS sp_get_line_stoppages(varchar);
+DROP FUNCTION IF EXISTS sp_get_line_stoppages(varchar, timestamp, timestamp);
+
+CREATE OR REPLACE FUNCTION sp_get_line_stoppages(
+  p_plant_code varchar DEFAULT NULL,
+  p_from timestamp DEFAULT NULL,
+  p_to timestamp DEFAULT NULL
+)
+RETURNS TABLE(
+  id integer, plant_code varchar, plant_name varchar,
+  shop_code bigint, shop_name varchar,
+  module_code bigint, module_name varchar,
+  line_code bigint, line_name varchar,
+  machine_code varchar, mchn_name varchar, sap_mchn_code varchar,
+  type_code varchar, type_desc varchar,
+  linereason_code varchar, gap_name varchar,
+  reason varchar, loto integer, status varchar,
+  starttime timestamp, endtime timestamp, close_date timestamp,
+  closure text, spares varchar,
+  hours numeric, mins bigint,
+  servicetype varchar, breakdowntype varchar,
+  notification_no varchar, closedstatus text,
+  emp_no varchar, emp_name varchar,
+  closure_emp_no varchar, closure_emp_name varchar
+) AS $$
+DECLARE
+  v_custom boolean := (p_from IS NOT NULL OR p_to IS NOT NULL);
+  v_from   timestamp := COALESCE(p_from, (CURRENT_DATE - 1)::timestamp);   -- T-1, 00:00
+  v_to     timestamp := CASE WHEN p_to IS NULL THEN NULL ELSE date_trunc('day', p_to) + INTERVAL '1 day' END;
+BEGIN
+  RETURN QUERY
+  SELECT DISTINCT ON (t."Id")
+         t."Id", t."Plant_Code", p.plant_name,
+         t."Shop_Code", s."Shop_Name",
+         t."Module_Code", m."Module_Name",
+         t."Line_Code", l."Line_Name",
+         t."Machine_Code",
+         (SELECT mc."Mchn_Name"::varchar FROM "Mst_Machine" mc WHERE TRIM(mc."Mchn_code"::text) = TRIM(t."Machine_Code"::text) LIMIT 1),
+         (SELECT mc."SAPMchn_Code"::varchar FROM "Mst_Machine" mc WHERE TRIM(mc."Mchn_code"::text) = TRIM(t."Machine_Code"::text) LIMIT 1),
+         t."Type_Code", tp."Type_Desc",
+         t."LineReason_Code", g."Gap_Name",
+         COALESCE(NULLIF(TRIM(t."Details"), ''),
+                  CASE WHEN TRIM(t."Reason") ~ '^[0-9]+$' THEN NULL ELSE t."Reason" END)::varchar,
+         t."Loto", t."Status",
+         t."Entry_Date", t."Close_Date", t."Close_Date",
+         COALESCE(
+           CASE WHEN t."Close_Date" IS NOT NULL AND NULLIF(TRIM(t."Reason"), '') IS NOT NULL AND TRIM(t."Reason") !~ '^[0-9]+$'
+                THEN t."Reason" END,
+           (SELECT cl."Reason" FROM "Mst_Closure" cl WHERE cl."Closure_ID"::text = TRIM(t."Closure"::text) LIMIT 1),
+           t."Closure"
+         )::text,
+         t."Spares",
+         ROUND((EXTRACT(EPOCH FROM (COALESCE(t."Close_Date", NOW()) - t."Entry_Date"))/3600)::numeric, 2),
+         FLOOR(MOD((EXTRACT(EPOCH FROM (COALESCE(t."Close_Date", NOW()) - t."Entry_Date"))/60)::numeric, 60))::bigint,
+         t.servicetype,
+         COALESCE((SELECT bd."BD_Name" FROM "Mst_BreakDown" bd WHERE bd."BD_ID"::text = TRIM(t."Breakdowntype"::text) LIMIT 1),
+                  t."Breakdowntype")::varchar,
+         t."Notification_No", t."closedstatus"::text,
+         t."Created_Empcode"::varchar, t."Created_Empname"::varchar,
+         t."Closure_Empcode"::varchar, t."Closure_Empname"::varchar
+  FROM "Trn_LineStoppage" t
+  JOIN "plant" p ON t."Plant_Code" = p.plant_code
+  LEFT JOIN "Mst_Shop" s ON t."Shop_Code" = s."Shop_code"
+  LEFT JOIN "Mst_Module" m ON t."Module_Code" = m."Module_Code"
+  LEFT JOIN "Mst_Line" l ON t."Line_Code" = l."Line_code"
+  LEFT JOIN "Mst_Type" tp ON t."Type_Code"::text = tp."Id"::text AND t."Plant_Code"::text = tp."Plant_Code"::text
+  LEFT JOIN "Mst_Gap" g ON t."LineReason_Code"::text = g."Id"::text AND t."Plant_Code"::text = g."Plant_Code"::text
+  WHERE COALESCE(t."Del_Status", 'N') = 'N'
+    AND (p_plant_code IS NULL OR t."Plant_Code" = p_plant_code)
+    AND (
+         -- OPEN tickets: all of them by default; judged by START time when a range is given
+         (t."Close_Date" IS NULL
+          AND (NOT v_custom OR (t."Entry_Date" >= v_from AND (v_to IS NULL OR t."Entry_Date" < v_to))))
+         OR
+         -- CLOSED tickets: judged by CLOSE time (default: since yesterday 00:00)
+         t."Id" IN (SELECT x."Id" FROM "Trn_LineStoppage" x
+                    WHERE COALESCE(x."Del_Status", 'N') = 'N'
+                      AND x."Close_Date" IS NOT NULL
+                      AND x."Close_Date" >= v_from AND (v_to IS NULL OR x."Close_Date" < v_to)
+                      AND (p_plant_code IS NULL OR x."Plant_Code" = p_plant_code)
+                    ORDER BY x."Close_Date" DESC LIMIT 5000)
+        )
+  ORDER BY t."Id" DESC, t."Entry_Date" DESC NULLS LAST;
+END;
+$$ LANGUAGE plpgsql;

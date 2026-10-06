@@ -170,12 +170,11 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 // POST bulk-create employees from a parsed spreadsheet (the frontend reads
 // the .xlsx client-side with the same "xlsx" library it already uses for
 // exports, and posts the parsed rows here as plain JSON - no file upload
-// handling needed on this side). Restricted to BU Admin only, per request -
-// a company-scoped full admin bulk-loading their own company's employees.
+// handling needed on this side). Restricted to Plant Admin and BU Admin only.
 router.post('/bulk-upload', authMiddleware, async (req, res) => {
   const role = String(req.user?.role || req.user?.empGroup || '').trim().toLowerCase();
-  if (role !== 'bu admin') {
-    return res.status(403).json({ message: 'Bulk employee upload is restricted to BU Admin.' });
+  if (role !== 'bu admin' && role !== 'plant admin') {
+    return res.status(403).json({ message: 'Bulk employee upload is restricted to Plant Admin and BU Admin.' });
   }
 
   const { employees } = req.body;
@@ -202,13 +201,36 @@ router.post('/bulk-upload', authMiddleware, async (req, res) => {
         continue;
       }
 
+      // Plant must be a real, existing plant - bulk upload cannot create employees
+      // against a typo'd or nonexistent plant code.
+      const plantRes = await db.query('SELECT 1 FROM "plant" WHERE plant_code::text = $1::text LIMIT 1', [plantCode]);
+      if (plantRes.rows.length === 0) {
+        results.push({ row: rowNum, empNo, success: false, message: `Plant "${plantCode}" not found in Plant Master.` });
+        continue;
+      }
+
       const designation = row.designation || row.Designation || null;
       const mailId = row.mailId || row.Mail_Id || null;
       const mobileNo = row.mobileNo || row.Mobile_No ? String(row.mobileNo || row.Mobile_No) : null;
       const password = row.password || row.Password || 'Welcome@123';
-      const empGroup = String(row.empGroup || row.Emp_Group || 'Plant Admin').trim();
       const companyCode = row.companyCode || row.Company_Code || null;
-      const isAdmin = empGroup.toLowerCase() === 'super admin' || empGroup.toLowerCase() === 'bu admin';
+
+      // Bulk upload can only ever create rank-and-file employees, never admin-tier
+      // roles - those must be created through the regular admin flows where the
+      // creator is deliberately granting that power, not slipped in via a spreadsheet.
+      const empGroupRaw = String(row.empGroup || row.Emp_Group || '').trim();
+      const empGroup = empGroupRaw || 'Executive';
+      const empGroupLower = empGroup.toLowerCase();
+      const restrictedGroups = ['bu admin', 'super admin', 'plant admin'];
+      if (restrictedGroups.includes(empGroupLower)) {
+        results.push({ row: rowNum, empNo, success: false, message: `Emp_Group "${empGroup}" is not allowed via bulk upload. Use Operator or Executive.` });
+        continue;
+      }
+      if (empGroupLower !== 'operator' && empGroupLower !== 'executive') {
+        results.push({ row: rowNum, empNo, success: false, message: `Emp_Group must be Operator or Executive, got "${empGroup}".` });
+        continue;
+      }
+      const isAdmin = false;
 
       // Department is entered by NAME in the template (dept_id is an internal
       // auto-generated PK nobody should have to look up first) - resolve it

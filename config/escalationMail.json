@@ -1,11 +1,14 @@
 {
-  "enabled": false,
-  "windowStartHour": 9,
-  "windowEndHour": 9,
-  "windowEndMinute": 30,
-  "checkIntervalSeconds": 300,
+  "enabled": true,
+  "windowStartHour": 0,
+  "windowEndHour": 23,
+  "windowEndMinute": 59,
+  "checkIntervalSeconds": 30,
   "mailType": "BreakDownMail",
-  "smtpHost": "121.241.224.4",
+  "smtpHost": "10.101.0.10",
   "smtpPort": 25,
   "fromAddress": "noreplyrml@ranegroup.com"
 }
+
+
+

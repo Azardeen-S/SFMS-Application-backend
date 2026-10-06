@@ -34,7 +34,7 @@ router.get('/stats', authMiddleware, async (req, res) => {
     const [plantsRow, empRow, stopRow, lineRow] = await Promise.all([
       db.query(`SELECT COUNT(*) AS c FROM "plant" WHERE "del_status" = 'N' ${scoped ? 'AND plant_code = ANY($1::varchar[])' : ''}`, params),
       db.query(`SELECT COUNT(*) AS c FROM "Mst_Employee" WHERE "Del_Status" = 'N' ${scoped ? 'AND "Plant_Code" = ANY($1::varchar[])' : ''}`, params),
-      db.query(`SELECT COUNT(*) AS c FROM "Trn_LineStoppage" WHERE "Status" = 'O' AND "Del_Status" = 'N' ${scoped ? 'AND "Plant_Code"::text = ANY($1::varchar[])' : ''}`, params),
+      db.query(`SELECT COUNT(*) AS c FROM "Trn_LineStoppage" WHERE "Close_Date" IS NULL AND "Del_Status" = 'N' ${scoped ? 'AND "Plant_Code"::text = ANY($1::varchar[])' : ''}`, params),
       db.query(`SELECT COUNT(*) AS c FROM "Mst_Line" WHERE "Del_Status" = 'N' ${scoped ? 'AND "Plant_code" = ANY($1::varchar[])' : ''}`, params),
     ]);
 

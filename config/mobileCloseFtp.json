@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "intervalSeconds": 60,
+  "batchSize": 20
+}

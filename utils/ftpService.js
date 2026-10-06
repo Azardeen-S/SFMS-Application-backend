@@ -13,8 +13,8 @@ async function uploadFileToFTP(localFilePath, remoteFileName) {
   client.ftp.verbose = false;
 
   try {
-    const ftpHost = process.env.FTP_HOST || '192.168.31.92';
-    // const ftpHost = process.env.FTP_HOST || '10.51.12.45';
+    // const ftpHost = process.env.FTP_HOST || '192.168.31.103';
+    const ftpHost = process.env.FTP_HOST || '10.51.12.45';
     const ftpPort = parseInt(process.env.FTP_PORT || '21', 10);
     const ftpUser = process.env.FTP_USER || 'Rane/16221';
     const ftpPass = process.env.FTP_PASS || process.env.FTP_PWD || 'Ayaaz@001';

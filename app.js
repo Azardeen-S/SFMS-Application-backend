@@ -27,6 +27,7 @@ const smsLogRoutes = require('./routes/smsLog');
 const { startNotificationSync } = require('./utils/notificationSyncService');
 const { startSmsNotification } = require('./utils/smsNotificationService');
 const { startEscalationMail } = require('./utils/escalationMailService');
+const { startMobileCloseFtp } = require('./utils/mobileCloseFtpService');
 
 const app = express();
 const PORT = process.env.PORT || 6000;
@@ -150,6 +151,7 @@ app.listen(PORT, () => {
   // utils/smsNotificationService.js and utils/escalationMailService.js.
   startSmsNotification();
   startEscalationMail();
+  startMobileCloseFtp();
 });
 
 module.exports = app;
